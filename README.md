@@ -1,16 +1,10 @@
 # Monkeats Blast Radius
 An offline test selector for SQLGlot eb11aec4be8cb2122afe713a4816662c3f0fb2fa.
 
-The numbered inventory is matched by pytest node ID. Baseline line execution and fixture reads are measured once using Python's monitoring and audit APIs. Static fixture references supplement the trace. For source edits with measured coverage the selector includes incomplete traces as a precaution. Changes without coverage get the full suite. The scheduler tries one through eight workers and chooses the lowest estimated bill. Sample labels are used only by the external evaluator.
+At build time the image retrieves the pinned SQLGlot checkout and measures baseline line coverage, fixture accesses and the class hierarchy of dialect objects used by each test. Child-pool work runs inline during tracing. A prefetched baseline map provides a fallback if the profiler exceeds its time budget. Runtime needs only Python's standard library.
 
-## Run
-Build with `docker build --platform linux/amd64 -t blast-radius .`. Mount the scorer input at /data, or run `python3 selector.py /path/to/sample` directly. Output is compact JSON Lines.
+The selector applies each diff to baseline source in memory, compares Python syntax trees and widens the selection for module-level or unrecognized changes. A local edit selects tests that executed the changed lines, cheap tests and tests with incomplete baseline traces. Fixture changes select measured readers and tests with static references. A greedy scheduler evaluates one through eight workers and chooses the least costly schedule.
 
-## Rebuild the maps
-With a clean checkout at the pinned SHA and the official test inventory, run the following (Python 3.12+ for measurement). The project uses Python's standard library. The public map was generated on macOS with pandas, numpy and python-dateutil available. Missing optional dependencies cause incomplete traces. Multiprocess work may also be absent from a parent trace.
-```sh
-python3 measure.py /path/to/sqlglot /path/to/tests.json map.json.gz
-python3 index_strings.py /path/to/sqlglot > strings.json
-python3 index_fixtures.py /path/to/sqlglot /path/to/tests.json > fixtures.json
-```
-The competition starter supplies the pinned Python image and input/output format. The dependency maps are derived from SQLGlot's MIT-licensed source and tests. The submitted selector uses no per-patch answer table.
+Run with the official starter kit's Docker flags and /data mount, or set SQLGLOT_ROOT to a pinned checkout and run `python selector.py /path/to/sample`. Evaluate the JSON Lines output with the supplied score.py. The selector never reads sample answers. Source-only analysis can miss indirect effects from introspection or differences between baseline and patched control flow.
+
+The pinned image and test inventory come from the competition starter. The maps are derived from SQLGlot's MIT-licensed tests and code. measure.py regenerates the trace map from a clean checkout and inventory.json. index_fixtures.py generates fixtures.json from that checkout and the official tests.json.

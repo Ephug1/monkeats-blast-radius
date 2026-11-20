@@ -1,78 +1,65 @@
-"""Select tests from baseline execution traces and fixture dependencies."""
+"""Select tests from pinned-commit coverage, fixture dependencies and syntax."""
 import gzip
 import json
+import os
 import re
 import sys
 from pathlib import Path
 from scheduler import schedule
+from structure import inspect_patch
 
 HERE = Path(__file__).parent
-HUNK = re.compile(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@")
-def changes(patch):
-    files = {}
-    path = None
-    line = 0
-    for row in patch.splitlines():
-        if row.startswith("diff --git "):
-            path = None
-        elif row.startswith("+++ b/"):
-            path = row[6:]
-            files.setdefault(path, [])
-        elif row.startswith("@@ "):
-            match = HUNK.match(row)
-            if not match:
-                return {}
-            line = int(match[1])
-        elif path and row.startswith(("+", "-")):
-            files[path].append((line, row))
-            line += row[0] == "-"
-        elif row.startswith(" "):
-            line += 1
-    return files
+SOURCE = Path(os.environ.get("SQLGLOT_ROOT", "/src"))
+FILE = re.compile(r"^\+\+\+ b/([^\t\n]+)", re.M)
 
-def select(files, index):
+def select(patch, index):
     full = (1 << len(index["ids"])) - 1
-    if not files:
-        return full
-    mask = 0
-    for path, edits in files.items():
-        if not edits:
+    selected = 0
+    sections = re.split(r"(?m)^diff --git ", patch)
+    for section in sections[1:] or sections:
+        match = FILE.search(section)
+        if not match:
             return full
+        path = match[1]
         if path.startswith("tests/fixtures/"):
-            readers = index["fixtures"].get(path)
-            if readers:
-                mask |= int(readers, 16)
-            else:
-                mask |= index["static"].get(path, index["incomplete"])
+            readers = int(index["fixtures"].get(path, "0"), 16) | index["static"].get(path, 0)
+            selected |= readers or full
             continue
         if not path.endswith(".py"):
             return full
-        if all(row[1:].lstrip().startswith("#") and n > 2 and n not in index["strings"].get(path, ()) for n,row in edits):
+        kind, edits = inspect_patch(SOURCE, section, path)
+        if kind == "equivalent":
             continue
-        rows = index["lines"].get(path, {})
-        removed = [n for n,row in edits if row.startswith("-")]
-        positions = removed or [neighbor for n,_ in edits for neighbor in (n-1,n)]
-        selected = 0
-        for n in positions:
-            selected |= int(rows.get(str(n), "0"), 16)
-        if not selected:
+        if kind == "dialect":
+            roles = index.get("roles", {}).get(path)
+            if not roles:
+                return full
+            selected |= int(roles,16) | index["cheap"] | index["incomplete"]
+            for mask in index["lines"].get(path,{}).values():
+                selected |= int(mask,16)
+            continue
+        if kind == "broad":
             return full
-        mask |= selected | index["incomplete"]
-    return mask
+        rows = index["lines"].get(path,{})
+        hits = 0
+        for pos in edits:
+            hits |= int(rows.get(str(pos),"0"),16)
+        selected |= hits | index["incomplete"] | index["cheap"]
+    return selected
 
 def main():
     data = Path(sys.argv[1]) if len(sys.argv)>1 else Path("/data")
     tests = json.loads((data/"tests.json").read_text())["tests"]
     with gzip.open(HERE/"map.json.gz","rt") as stream:
         index = json.load(stream)
-    index["strings"] = json.loads((HERE/"strings.json").read_text())
-    index["incomplete"] = sum(1 << i for i in index["unknown"])
     positions = {name:i for i,name in enumerate(index["ids"])}
+    index["incomplete"] = sum(1 << i for i in index["unknown"])
+    index["cheap"] = sum(1 << positions[t["id"]] for t in tests if t["seconds"] <= 0.005 and t["id"] in positions)
     refs = json.loads((HERE/"fixtures.json").read_text())
     index["static"] = {p:sum(1 << positions[name] for name in names if name in positions) for p,names in refs.items()}
     cache = {}
     for patch in sorted((data/"commits").glob("*.patch")):
-        mask = select(changes(patch.read_text(errors="replace")), index)
+        mask = select(patch.read_text(errors="replace"), index)
         if mask not in cache:
             durations = {t["number"]:t["seconds"] for t in tests if t["id"] not in positions or (mask >> positions[t["id"]]) & 1}
             cache[mask] = schedule(durations)
