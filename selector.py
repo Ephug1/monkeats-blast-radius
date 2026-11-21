@@ -94,7 +94,7 @@ def select(patch, index):
 def replay_small_selection(patch, tests, durations):
     """Remove passing unittest cases after a bounded isolated replay."""
     total = sum(durations.values())
-    if not durations or total > 1.0 or len(durations) > 48:
+    if not durations or total > 3.0 or len(durations) > 64:
         return durations
     if len(durations) < 3 and total < 0.15:
         return durations
@@ -108,7 +108,7 @@ def replay_small_selection(patch, tests, durations):
         run = subprocess.run(
             [sys.executable, "-B", __file__, "--replay"],
             input=json.dumps([patch, chosen]), text=True,
-            capture_output=True, timeout=1.8,
+            capture_output=True, timeout=min(3.0, 1.0 + total),
         )
         if run.returncode or not run.stdout.startswith("MONKEATS_REPLAY "):
             return durations
