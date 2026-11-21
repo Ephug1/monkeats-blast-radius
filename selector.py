@@ -34,18 +34,25 @@ def select(patch, index):
         # setup or an external integration failed. Unloaded tests stay broad.
         observed = index["module_hits"].get(path, 0)
         unknown = index["unloaded"] | (index["incomplete"] & observed)
+        if len(sections) <= 2:
+            unknown &= ~index["partial"]
         if kind.startswith("expression:"):
             name = kind.partition(":")[2]
             roles = index.get("classes", {}).get(path + ":" + name)
             if roles is None:
                 return full
-            selected |= int(roles, 16) | index["cheap"] | unknown
+            selected |= int(roles, 16) | unknown
             continue
-        if kind == "dialect":
+        if kind.startswith("dialect"):
+            name = kind.partition(":")[2]
+            roles = index.get("classes", {}).get(path + ":" + name)
+            if roles is not None:
+                selected |= int(roles, 16) | unknown
+                continue
             roles = index.get("roles", {}).get(path)
             if not roles:
                 return full
-            selected |= int(roles,16) | index["cheap"] | unknown
+            selected |= int(roles,16) | unknown
             for mask in index["lines"].get(path,{}).values():
                 selected |= int(mask,16)
             continue
@@ -55,7 +62,7 @@ def select(patch, index):
         hits = 0
         for pos in edits:
             hits |= int(rows.get(str(pos),"0"),16)
-        selected |= hits | unknown | index["cheap"]
+        selected |= hits | unknown
     return selected
 
 def main():
@@ -65,6 +72,7 @@ def main():
         index = json.load(stream)
     positions = {name:i for i,name in enumerate(index["ids"])}
     index["incomplete"] = sum(1 << i for i in index["unknown"])
+    index["partial"] = sum(1 << i for i in index.get("partial_subtests", ()))
     index["module_hits"] = {}
     for path, rows in index["lines"].items():
         mask = int(index.get("roles", {}).get(path, "0"), 16)
@@ -76,7 +84,6 @@ def main():
         path = index["ids"][i].split("::")[0]
         if not (index["module_hits"].get(path, 0) & (1 << i)):
             index["unloaded"] |= 1 << i
-    index["cheap"] = sum(1 << positions[t["id"]] for t in tests if t["seconds"] <= 0.005 and t["id"] in positions)
     refs = json.loads((HERE/"fixtures.json").read_text())
     index["static"] = {p:sum(1 << positions[name] for name in names if name in positions) for p,names in refs.items()}
     cache = {}

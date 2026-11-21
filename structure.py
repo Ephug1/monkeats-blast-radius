@@ -15,6 +15,65 @@ def baseline(path):
                  for node in ast.walk(tree) if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef))]
     return text.splitlines(), ast.dump(tree), functions
 
+@lru_cache(maxsize=4)
+def enum_attributes(source_root):
+    """Find attributes whose explicit assignments all construct the same enum."""
+    assignments = {}
+    names = set()
+    for folder in ("sqlglot", "tests"):
+        for path in (source_root / folder / "dialects").glob("*.py"):
+            if not path.is_file():
+                continue
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.ClassDef) and any(
+                    isinstance(base, ast.Name) and base.id in {"Enum", "AutoName"}
+                    for base in node.bases
+                ):
+                    names.add(node.name)
+                if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value:
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    for target in targets:
+                        if isinstance(target, ast.Attribute) or (isinstance(target, ast.Name) and target.id.isupper()):
+                            name = target.id if isinstance(target, ast.Name) else target.attr
+                            assignments.setdefault(name, []).append(node.value)
+    def enum_type(value):
+        if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name):
+            if value.value.id in names:
+                return value.value.id
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
+            if value.func.id in names:
+                return value.func.id
+        if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name):
+            if value.value.id == "self" and value.attr.isupper():
+                return resolved.get(value.attr)
+        return None
+    resolved = {}
+    for key in sorted(assignments, key=lambda name: not name.isupper()):
+        possibilities = {enum_type(value) for value in assignments[key]}
+        if len(possibilities) == 1 and None not in possibilities:
+            resolved[key] = possibilities.pop()
+    return resolved
+
+def canonical_enum_comparisons(tree, attributes):
+    class Normalize(ast.NodeTransformer):
+        def visit_Compare(self, node):
+            self.generic_visit(node)
+            if len(node.ops) != 1:
+                return node
+            left, right = node.left, node.comparators[0]
+            if (
+                isinstance(left, ast.Attribute) and isinstance(left.value, ast.Name)
+                and left.value.id == "self" and isinstance(right, ast.Attribute)
+                and isinstance(right.value, ast.Name)
+                and attributes.get(left.attr) == right.value.id
+            ):
+                if isinstance(node.ops[0], ast.Is):
+                    node.ops[0] = ast.Eq()
+                if isinstance(node.ops[0], ast.IsNot):
+                    node.ops[0] = ast.NotEq()
+            return node
+    return ast.dump(Normalize().visit(tree))
+
 def inspect_patch(source_root, patch, path):
     """Return equivalent, local or broad, plus affected base line numbers."""
     original = (source_root/path).resolve()
@@ -62,6 +121,12 @@ def inspect_patch(source_root, patch, path):
         return "broad", edits
     if ast.dump(new) == old_ast:
         return "equivalent", edits
+    if path.startswith("sqlglot/dialects/") and re.search(r"(?m)^[+-].*(?:==|!=| is )", patch):
+        attributes = enum_attributes(source_root)
+        old_semantics = canonical_enum_comparisons(ast.parse("\n".join(lines)), attributes)
+        new_semantics = canonical_enum_comparisons(ast.parse("\n".join(out)), attributes)
+        if old_semantics == new_semantics:
+            return "equivalent", edits
     # Lambda bodies stored in dispatch tables execute on lookup, even when
     # their enclosing assignment executes at import time.
     original_tree = ast.parse("\n".join(lines))
@@ -89,5 +154,19 @@ def inspect_patch(source_root, patch, path):
                     ):
                         return "expression:" + cls.name, edits
                 return "broad", edits
+            matching_classes = [
+                cls for cls in ast.walk(original_tree)
+                if isinstance(cls, ast.ClassDef) and edits and all(
+                    cls.lineno < pos <= cls.end_lineno for pos in edits
+                )
+            ]
+            if matching_classes:
+                cls = min(matching_classes, key=lambda cls: cls.end_lineno - cls.lineno)
+                owners = sorted(
+                    (owner for owner in matching_classes if owner is not cls),
+                    key=lambda owner: owner.lineno,
+                )
+                name = ".".join([owner.name for owner in owners] + [cls.name])
+                return "dialect:" + name, edits
             return "dialect", edits
     return "broad", edits
