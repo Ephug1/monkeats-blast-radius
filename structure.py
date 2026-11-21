@@ -25,6 +25,7 @@ def inspect_patch(source_root, patch, path):
     cursor = 0
     edits = set()
     has_hunk = False
+    replacing = False
     for line in patch.splitlines():
         if line.startswith("@@ "):
             header = HEADER.match(line)
@@ -36,17 +37,20 @@ def inspect_patch(source_root, patch, path):
             out.extend(lines[cursor:begin])
             cursor = begin
             has_hunk = True
+            replacing = False
         elif has_hunk and line.startswith(("-", " ")):
             if cursor >= len(lines) or lines[cursor] != line[1:]:
                 return "broad", edits
-            if line.startswith("-"):
+            replacing = line.startswith("-")
+            if replacing:
                 edits.add(cursor+1)
             else:
                 out.append(lines[cursor])
             cursor += 1
         elif has_hunk and line.startswith("+"):
-            edits.add(max(1,cursor))
-            edits.add(cursor+1)
+            if not replacing:
+                edits.add(max(1, cursor))
+                edits.add(cursor + 1)
             out.append(line[1:])
     out.extend(lines[cursor:])
     if not has_hunk:
@@ -58,17 +62,32 @@ def inspect_patch(source_root, patch, path):
         return "broad", edits
     if ast.dump(new) == old_ast:
         return "equivalent", edits
+    # Lambda bodies stored in dispatch tables execute on lookup, even when
+    # their enclosing assignment executes at import time.
+    original_tree = ast.parse("\n".join(lines))
+    for node in ast.walk(original_tree):
+        if isinstance(node, ast.Lambda) and edits and all(
+            node.body.lineno < pos <= node.body.end_lineno for pos in edits
+        ):
+            return "local", edits | {node.body.lineno}
     if all(any(start < pos and body <= pos <= end for start,body,end in functions) for pos in edits):
         return "local", edits
     # A change of literals inside an existing dialect class cannot add an
     # unresolved Python name at import time. Include every observed consumer
     # of that class hierarchy, including users of derived dialects.
-    if path.startswith(("sqlglot/dialects/", "sqlglot/generators/", "sqlglot/parsers/")):
+    if path.startswith(("sqlglot/expressions/", "sqlglot/dialects/", "sqlglot/generators/", "sqlglot/parsers/")):
         def without_values(tree):
             class HideConstants(ast.NodeTransformer):
                 def visit_Constant(self, node):
                     return ast.Constant(value=None)
             return ast.dump(HideConstants().visit(tree))
         if without_values(new) == without_values(ast.parse("\n".join(lines))):
+            if path.startswith("sqlglot/expressions/"):
+                for cls in ast.walk(original_tree):
+                    if isinstance(cls, ast.ClassDef) and edits and all(
+                        cls.lineno < pos <= cls.end_lineno for pos in edits
+                    ):
+                        return "expression:" + cls.name, edits
+                return "broad", edits
             return "dialect", edits
     return "broad", edits

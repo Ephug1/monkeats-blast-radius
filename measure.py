@@ -16,6 +16,7 @@ def main():
     sys.path.insert(0, str(root))
     # Execute process-pool jobs inline so coverage includes test worker code.
     import concurrent.futures as futures
+    import pickle
     class InlinePool(futures.Executor):
         def __init__(self, *args, **kwargs):
             initializer = kwargs.get("initializer")
@@ -25,7 +26,9 @@ def main():
         def submit(self, fn, /, *args, **kwargs):
             future = futures.Future()
             try:
-                future.set_result(fn(*args, **kwargs))
+                callee, arguments, keywords = pickle.loads(pickle.dumps((fn, args, kwargs)))
+                value = callee(*arguments, **keywords)
+                future.set_result(pickle.loads(pickle.dumps(value)))
             except Exception as error:
                 future.set_exception(error)
             return future
@@ -34,6 +37,7 @@ def main():
     hits = defaultdict(dict)
     fixtures = defaultdict(int)
     unknown = []
+    partial_subtests = set()
     active = 0
     tool = sys.monitoring.COVERAGE_ID
     monitor = sys.monitoring
@@ -52,8 +56,9 @@ def main():
     monitor.use_tool_id(tool, "test coverage")
     monitor.register_callback(tool, monitor.events.LINE, line)
     from functools import wraps
-    from sqlglot import Dialect, Parser, Generator, Tokenizer
+    from sqlglot import Dialect, Parser, Generator, Tokenizer, exp
     roles = defaultdict(int)
+    classes = defaultdict(int)
     def observe_init(cls):
         original = cls.__init__
         @wraps(original)
@@ -64,28 +69,64 @@ def main():
                 for base in key.__mro__:
                     module = base.__module__
                     if module.startswith("sqlglot."):
-                        roles[module.replace(".", "/")+".py"] |= active
+                        path = module.replace(".", "/")+".py"
+                        roles[path] |= active
+                        classes[path + ":" + base.__qualname__] |= active
             original(instance, *args, **kwargs)
         cls.__init__ = tracked
     seen = set()
-    for cls in (Dialect, Parser, Generator, Tokenizer):
+    for cls in (Dialect, Parser, Generator, Tokenizer, exp.Expr):
         observe_init(cls)
-    ids = []
-    for test in tests:
+    ids = [test["id"] for test in tests]
+    by_class = defaultdict(list)
+    for i, name in enumerate(ids):
+        by_class[name.rsplit("::", 1)[0]].append((i, name))
+    def activate(mask):
+        nonlocal active
+        active = mask
         seen.clear()
-        ids.append(test["id"])
-        target = test["id"].replace(".py::", "::").replace("/", ".").replace("::", ".")
-        suite = unittest.defaultTestLoader.loadTestsFromName(target)
-        active = 1 << (len(ids)-1)
         monitor.restart_events()
+    for members in by_class.values():
+        targets = []
+        positions = {}
+        for i, name in members:
+            target = name.replace(".py::", "::").replace("/", ".").replace("::", ".")
+            loaded = list(unittest.defaultTestLoader.loadTestsFromName(target))
+            if len(loaded) != 1 or not isinstance(loaded[0], unittest.TestCase):
+                unknown.append(i)
+                continue
+            targets.append(loaded[0])
+            positions[id(loaded[0])] = i
+        shared = sum(1 << i for i in positions.values())
+        completed = set()
+        class Result(unittest.TestResult):
+            def startTest(self, test):
+                super().startTest(test)
+                activate(1 << positions[id(test)])
+            def addSubTest(self, test, subtest, err):
+                super().addSubTest(test, subtest, err)
+                if err is not None:
+                    partial_subtests.add(positions[id(test)])
+            def addError(self, test, err):
+                super().addError(test, err)
+                partial_subtests.discard(positions.get(id(test)))
+            def addFailure(self, test, err):
+                super().addFailure(test, err)
+                partial_subtests.discard(positions.get(id(test)))
+            def addSuccess(self, test):
+                super().addSuccess(test)
+                completed.add(positions[id(test)])
+            def stopTest(self, test):
+                super().stopTest(test)
+                activate(shared)
+        activate(shared)
         monitor.set_events(tool, monitor.events.LINE)
-        result = unittest.TestResult()
-        suite.run(result)
+        result = Result()
+        unittest.TestSuite(targets).run(result)
         monitor.set_events(tool, 0)
         active = 0
-        if result.errors or result.failures or result.skipped:
-            unknown.append(len(ids)-1)
-    out = {"roles": {p:hex(m) for p,m in roles.items()}, "ids": ids, "unknown": unknown, "fixtures": {p:hex(m) for p,m in fixtures.items()},
+        unknown.extend(set(positions.values()) - completed)
+    out = {"partial_subtests": sorted(partial_subtests), "classes": {p:hex(m) for p,m in classes.items()}, "roles": {p:hex(m) for p,m in roles.items()}, "ids": ids, "unknown": unknown, "fixtures": {p:hex(m) for p,m in fixtures.items()},
            "lines": {p:{str(n):hex(m) for n,m in rows.items()} for p,rows in hits.items()}}
     with gzip.open(output, "wt") as stream:
         json.dump(out, stream, separators=(",", ":"))
