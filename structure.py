@@ -74,6 +74,63 @@ def canonical_enum_comparisons(tree, attributes):
             return node
     return ast.dump(Normalize().visit(tree))
 
+def canonical_none_comparisons(tree, source_root):
+    """Normalize None comparisons for annotated attributes with identity equality."""
+    modules = {
+        item.asname or item.name: node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.level == 0
+        and node.module and node.module.startswith("sqlglot.")
+        for item in node.names
+    }
+    for cls in (node for node in tree.body if isinstance(node, ast.ClassDef)):
+        if any(isinstance(node, ast.FunctionDef) and node.name == "__getattribute__"
+               for node in cls.body):
+            continue
+        attributes = set()
+        for node in ast.walk(cls):
+            if not isinstance(node, ast.AnnAssign) or not isinstance(node.target, ast.Attribute):
+                continue
+            if not isinstance(node.target.value, ast.Name) or node.target.value.id != "self":
+                continue
+            if not (node.target.attr.startswith("_") and isinstance(node.value, ast.Constant)
+                    and node.value.value is None):
+                continue
+            hint = node.annotation
+            if not (isinstance(hint, ast.BinOp) and isinstance(hint.op, ast.BitOr)
+                    and isinstance(hint.left, ast.Name)
+                    and isinstance(hint.right, ast.Constant) and hint.right.value is None):
+                continue
+            name = hint.left.id
+            module = modules.get(name)
+            if module is None:
+                continue
+            origin = source_root / (module.replace(".", "/") + ".py")
+            if not origin.is_file():
+                continue
+            definitions = ast.parse(origin.read_text()).body
+            for definition in definitions:
+                if not isinstance(definition, ast.ClassDef) or definition.name != name:
+                    continue
+                if not definition.bases and not definition.decorator_list and not definition.keywords:
+                    if not any(isinstance(member, ast.FunctionDef)
+                               and member.name in {"__eq__", "__ne__"}
+                               for member in definition.body):
+                        attributes.add(node.target.attr)
+        for node in ast.walk(cls):
+            if not isinstance(node, ast.Compare) or len(node.ops) != 1:
+                continue
+            left, right = node.left, node.comparators[0]
+            if not (isinstance(left, ast.Attribute) and isinstance(left.value, ast.Name)
+                    and left.value.id == "self" and left.attr in attributes
+                    and isinstance(right, ast.Constant) and right.value is None):
+                continue
+            if isinstance(node.ops[0], ast.Is):
+                node.ops[0] = ast.Eq()
+            elif isinstance(node.ops[0], ast.IsNot):
+                node.ops[0] = ast.NotEq()
+    return ast.dump(tree)
+
 def inspect_patch(source_root, patch, path):
     """Return equivalent, local or broad, plus affected base line numbers."""
     original = (source_root/path).resolve()
@@ -125,6 +182,11 @@ def inspect_patch(source_root, patch, path):
         attributes = enum_attributes(source_root)
         old_semantics = canonical_enum_comparisons(ast.parse("\n".join(lines)), attributes)
         new_semantics = canonical_enum_comparisons(ast.parse("\n".join(out)), attributes)
+        if old_semantics == new_semantics:
+            return "equivalent", edits
+    if path.startswith("sqlglot/") and re.search(r"(?m)^[+-].*(?:==|!=| is ) None", patch):
+        old_semantics = canonical_none_comparisons(ast.parse("\n".join(lines)), source_root)
+        new_semantics = canonical_none_comparisons(ast.parse("\n".join(out)), source_root)
         if old_semantics == new_semantics:
             return "equivalent", edits
     # Lambda bodies stored in dispatch tables execute on lookup, even when
