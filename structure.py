@@ -185,6 +185,92 @@ def setting_reads(source_root, name):
                     reads.append((str(path.relative_to(source_root)), node.lineno))
     return tuple(reads)
 
+def fresh_expression_semantics(tree):
+    """A copied, freshly built table has no prior owner or shared root."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        fn, arg = node.func, node.args[0]
+        if ast.unparse(fn) != "exp.alias_" or not isinstance(arg, ast.Call):
+            continue
+        if ast.unparse(arg.func) != "exp.table_" or len(arg.args) != 1 or arg.keywords:
+            continue
+        if not isinstance(arg.args[0], (ast.Name, ast.Constant)):
+            continue
+        for kw in node.keywords:
+            if kw.arg == "copy" and isinstance(kw.value, ast.Constant) and type(kw.value.value) is bool:
+                kw.value = ast.Constant(value=True)
+    return ast.dump(tree)
+
+def version_boundary(old, new, edits):
+    """Return the single version where inclusive and exclusive bounds differ."""
+    matches = []
+    for tree in (old, new):
+        candidates = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Compare) or node.lineno not in edits or len(node.ops) != 1:
+                continue
+            if ast.unparse(node.left) != "self.dialect.version":
+                continue
+            op = node.ops[0]
+            if not isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE)):
+                continue
+            try:
+                boundary = ast.literal_eval(node.comparators[0])
+            except (ValueError, TypeError):
+                continue
+            if isinstance(boundary, tuple) and boundary and all(type(part) is int for part in boundary):
+                candidates.append((node, boundary, type(op)))
+        if len(candidates) != 1:
+            return None
+        matches.append(candidates[0])
+    (first, boundary, before), (second, after_boundary, after) = matches
+    if boundary != after_boundary or {before, after} not in ({ast.Lt, ast.LtE}, {ast.Gt, ast.GtE}):
+        return None
+    first_op, second_op = first.ops, second.ops
+    first.ops = second.ops = [ast.Eq()]
+    identical = ast.dump(old) == ast.dump(new)
+    first.ops, second.ops = first_op, second_op
+    return ",".join(map(str, boundary)) if identical else None
+
+def numeric_escape_value_edits(original, patched, cls, edits):
+    """Recognize value-only changes to a tokenizer's numeric escape table."""
+    if cls.name != "Tokenizer":
+        return None
+    values = []
+    for tree in (original, patched):
+        nodes = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Assign) and node.lineno in edits
+            and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "NUMERIC_ESCAPES"
+        ]
+        if len(nodes) != 1:
+            return None
+        node = nodes[0]
+        try:
+            table = ast.literal_eval(node.value)
+        except (TypeError, ValueError, SyntaxError):
+            return None
+        if not isinstance(table, dict) or not all(
+            isinstance(key, str) and len(key) == 1 and key.isalnum()
+            and isinstance(value, tuple) and len(value) == 4
+            and all(type(part) is int for part in value)
+            for key, value in table.items()
+        ):
+            return None
+        values.append((node, table))
+    (left, before), (right, after) = values
+    if before.keys() != after.keys():
+        return None
+    old_value, new_value = left.value, right.value
+    left.value = right.value = ast.Constant(value=None)
+    identical = ast.dump(original) == ast.dump(patched)
+    left.value, right.value = old_value, new_value
+    if identical:
+        return "".join(key for key in before if before[key] != after[key])
+    return None
+
 def inspect_patch(source_root, patch, path):
     """Return equivalent, local or broad, plus affected base line numbers."""
     original = (source_root/path).resolve()
@@ -243,6 +329,9 @@ def inspect_patch(source_root, patch, path):
         new_semantics = canonical_none_comparisons(ast.parse("\n".join(out)), source_root)
         if old_semantics == new_semantics:
             return "equivalent", edits
+    if path.startswith("sqlglot/") and "exp.alias_(" in patch and "copy=" in patch:
+        if fresh_expression_semantics(ast.parse("\n".join(lines))) == fresh_expression_semantics(ast.parse("\n".join(out))):
+            return "equivalent", edits
     # Lambda bodies stored in dispatch tables execute on lookup, even when
     # their enclosing assignment executes at import time.
     original_tree = ast.parse("\n".join(lines))
@@ -252,6 +341,10 @@ def inspect_patch(source_root, patch, path):
         ):
             return "local", edits | {node.body.lineno}
     if all(any(start < pos and body <= pos <= end for start,body,end in functions) for pos in edits):
+        if path.startswith("sqlglot/generators/") and "self.dialect.version" in patch:
+            boundary = version_boundary(original_tree, new, edits)
+            if boundary is not None:
+                return "version:" + boundary, edits
         return "local", edits
     # A change of literals inside an existing dialect class cannot add an
     # unresolved Python name at import time. Include every observed consumer
@@ -283,6 +376,9 @@ def inspect_patch(source_root, patch, path):
                     key=lambda owner: owner.lineno,
                 )
                 name = ".".join([owner.name for owner in owners] + [cls.name])
+                keys = numeric_escape_value_edits(original_tree, new, cls, edits)
+                if keys:
+                    return "token_escape:" + name + ":" + keys, edits
                 setting = changed_integer_setting(original_tree, new, cls, edits)
                 if setting:
                     return "dialect:" + name + ":" + setting, edits

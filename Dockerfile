@@ -11,4 +11,5 @@ COPY --from=profile /src/sqlglot /src/sqlglot
 COPY --from=profile /src/tests /src/tests
 COPY --from=profile /profile/map.json.gz /app/map.json.gz
 COPY selector.py scheduler.py structure.py fixtures.json /app/
+RUN python -m compileall -q /src/sqlglot /src/tests
 CMD ["python", "-B", "/app/selector.py"]

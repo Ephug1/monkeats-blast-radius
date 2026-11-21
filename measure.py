@@ -59,6 +59,31 @@ def main():
     from sqlglot import Dialect, Parser, Generator, Tokenizer, exp
     roles = defaultdict(int)
     classes = defaultdict(int)
+    token_escapes = defaultdict(int)
+    dialect_versions = defaultdict(int)
+    original_tokenize = Tokenizer.tokenize
+    @wraps(original_tokenize)
+    def tokenize(instance, sql):
+        if active and "\\" in sql:
+            for char in set(escape_prefix.findall(sql)):
+                for cls in type(instance).__mro__:
+                    if not cls.__module__.startswith("sqlglot."):
+                        continue
+                    key = cls.__module__.replace(".", "/") + ".py:" + cls.__qualname__
+                    token_escapes[key + ":" + char] |= active
+        return original_tokenize(instance, sql)
+    import re
+    escape_prefix = re.compile(r"(?<=\\)([0-7A-Za-z])")
+    Tokenizer.tokenize = tokenize
+    original_generate = Generator.generate
+    @wraps(original_generate)
+    def generate(instance, *args, **kwargs):
+        version = instance.dialect.version
+        if active and isinstance(version, tuple) and all(type(part) is int for part in version):
+            key = ",".join(map(str, version))
+            dialect_versions[key] |= active
+        return original_generate(instance, *args, **kwargs)
+    Generator.generate = generate
     def observe_init(cls):
         original = cls.__init__
         @wraps(original)
@@ -126,7 +151,10 @@ def main():
         monitor.set_events(tool, 0)
         active = 0
         unknown.extend(set(positions.values()) - completed)
-    out = {"partial_subtests": sorted(partial_subtests), "classes": {p:hex(m) for p,m in classes.items()}, "roles": {p:hex(m) for p,m in roles.items()}, "ids": ids, "unknown": unknown, "fixtures": {p:hex(m) for p,m in fixtures.items()},
+    out = {
+        "token_escapes": {key: hex(mask) for key, mask in token_escapes.items()},
+        "dialect_versions": {key: hex(mask) for key, mask in dialect_versions.items()},
+        "partial_subtests": sorted(partial_subtests), "classes": {p:hex(m) for p,m in classes.items()}, "roles": {p:hex(m) for p,m in roles.items()}, "ids": ids, "unknown": unknown, "fixtures": {p:hex(m) for p,m in fixtures.items()},
            "lines": {p:{str(n):hex(m) for n,m in rows.items()} for p,rows in hits.items()}}
     with gzip.open(output, "wt") as stream:
         json.dump(out, stream, separators=(",", ":"))
