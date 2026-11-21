@@ -6,7 +6,7 @@ import re
 import sys
 from pathlib import Path
 from scheduler import schedule
-from structure import inspect_patch
+from structure import inspect_patch, setting_reads
 
 HERE = Path(__file__).parent
 SOURCE = Path(os.environ.get("SQLGLOT_ROOT", "/src"))
@@ -44,10 +44,18 @@ def select(patch, index):
             selected |= int(roles, 16) | unknown
             continue
         if kind.startswith("dialect"):
-            name = kind.partition(":")[2]
+            name, _, setting = kind.partition(":")[2].partition(":")
             roles = index.get("classes", {}).get(path + ":" + name)
             if roles is not None:
-                selected |= int(roles, 16) | unknown
+                mask = int(roles, 16)
+                if setting:
+                    reads = setting_reads(SOURCE, setting)
+                    direct = 0
+                    for file, line in reads:
+                        direct |= int(index["lines"].get(file, {}).get(str(line), "0"), 16)
+                    if direct & mask:
+                        mask &= direct
+                selected |= mask | unknown
                 continue
             roles = index.get("roles", {}).get(path)
             if not roles:

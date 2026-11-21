@@ -131,6 +131,60 @@ def canonical_none_comparisons(tree, source_root):
                 node.ops[0] = ast.NotEq()
     return ast.dump(tree)
 
+def changed_integer_setting(original, patched, cls, edits):
+    """Recognize a single integer class setting whose type stays unchanged."""
+    candidates = [
+        node for node in cls.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value
+        and node.lineno in edits
+    ]
+    if len(candidates) != 1:
+        return None
+    node = candidates[0]
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+        return None
+    name = targets[0].id
+    if not name.isupper():
+        return None
+    # Replacing both values must erase the entire change. This excludes
+    # other edits in the same hunk or class.
+    candidate = next(
+        (item for item in ast.walk(patched)
+         if isinstance(item, type(node)) and item.lineno == node.lineno),
+        None,
+    )
+    if candidate is None or candidate.value is None:
+        return None
+    try:
+        if not all(type(ast.literal_eval(item.value)) is int for item in (node, candidate)):
+            return None
+    except (ValueError, TypeError, SyntaxError):
+        return None
+    old_value, new_value = node.value, candidate.value
+    node.value = candidate.value = ast.Constant(value=0)
+    identical = ast.dump(original) == ast.dump(patched)
+    node.value, candidate.value = old_value, new_value
+    return name if identical else None
+
+@lru_cache(maxsize=16)
+def setting_reads(source_root, name):
+    """Find explicit Python attribute reads, retaining broad fallback for reflection."""
+    reads = []
+    for package in ("sqlglot", "tests"):
+        for path in (source_root / package).rglob("*.py"):
+            source = path.read_text()
+            if name not in source:
+                continue
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and node.value == name:
+                    return ()
+                if (isinstance(node, ast.Attribute) and node.attr == name
+                        and isinstance(node.ctx, ast.Load)):
+                    reads.append((str(path.relative_to(source_root)), node.lineno))
+    return tuple(reads)
+
 def inspect_patch(source_root, patch, path):
     """Return equivalent, local or broad, plus affected base line numbers."""
     original = (source_root/path).resolve()
@@ -208,7 +262,7 @@ def inspect_patch(source_root, patch, path):
                 def visit_Constant(self, node):
                     return ast.Constant(value=None)
             return ast.dump(HideConstants().visit(tree))
-        if without_values(new) == without_values(ast.parse("\n".join(lines))):
+        if without_values(ast.parse("\n".join(out))) == without_values(ast.parse("\n".join(lines))):
             if path.startswith("sqlglot/expressions/"):
                 for cls in ast.walk(original_tree):
                     if isinstance(cls, ast.ClassDef) and edits and all(
@@ -229,6 +283,9 @@ def inspect_patch(source_root, patch, path):
                     key=lambda owner: owner.lineno,
                 )
                 name = ".".join([owner.name for owner in owners] + [cls.name])
+                setting = changed_integer_setting(original_tree, new, cls, edits)
+                if setting:
+                    return "dialect:" + name + ":" + setting, edits
                 return "dialect:" + name, edits
             return "dialect", edits
     return "broad", edits
